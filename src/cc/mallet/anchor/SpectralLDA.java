@@ -1,9 +1,15 @@
 package cc.mallet.anchor;
 
-import java.util.*;
-import java.io.*;
-import cc.mallet.util.*;
-import cc.mallet.types.*;
+import cc.mallet.types.Alphabet;
+import cc.mallet.types.IDSorter;
+import cc.mallet.types.InstanceList;
+import cc.mallet.util.CommandOption;
+import cc.mallet.util.Randoms;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.util.Arrays;
 
 public class SpectralLDA {
 
@@ -48,6 +54,7 @@ public class SpectralLDA {
 	int[] basisVectorIndices;
 	boolean[] rowIsBasisVector;
 
+	int wordIterations = 500;
 	double[][] anchorsTimesAnchors;
 
 	public SpectralLDA(BigramProbabilityMatrix matrix, StabilizedGS orthogonalizer) throws IOException {
@@ -69,6 +76,8 @@ public class SpectralLDA {
 		}
 	}
 
+	double wordConvergenceZero = 0.001;
+
 	public double[] recover(int word) {
 		//System.out.println("recovering word " + word + " / " + basisVectorIndices[0]);
 		
@@ -89,8 +98,8 @@ public class SpectralLDA {
 		int iteration = 0;
 
 		while ((Double.isInfinite(sumSquaredError) ||
-				Math.abs(Math.sqrt(previousSumSquaredError) - Math.sqrt(sumSquaredError)) > 0.000001) &&
-			   iteration < 500) {
+				Math.abs(Math.sqrt(previousSumSquaredError) - Math.sqrt(sumSquaredError)) > wordConvergenceZero) &&
+			   iteration < wordIterations) {
 			previousSumSquaredError = sumSquaredError;
 			sumSquaredError = 0.0;
 
@@ -136,7 +145,7 @@ public class SpectralLDA {
 			}
 		}
 
-		if (word % 100 == 0) { 
+		if (word % 250 == 0) {
 			System.err.format("%d\t%d\t%f\t%f\t%f\n", word, iteration, Math.log(sumSquaredError), entropy, entropy / Math.log(numTopics));
 		}
 

@@ -4,21 +4,15 @@ import cc.mallet.types.Alphabet;
 import cc.mallet.types.IDSorter;
 import cc.mallet.util.Randoms;
 import ciir.jfoley.chai.collections.list.IntList;
-import ciir.jfoley.chai.io.IO;
 import ciir.jfoley.chai.io.LinesIterable;
 import ciir.jfoley.chai.string.StrUtil;
 import gnu.trove.TIntIntHashMap;
-import org.jsoup.Jsoup;
 import org.lemurproject.galago.core.parse.TagTokenizer;
 import org.lemurproject.galago.core.util.WordLists;
 import org.lemurproject.galago.utility.Parameters;
 
 import java.io.IOException;
-import java.io.PrintWriter;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 
 /**
  * @author jfoley
@@ -40,7 +34,9 @@ public class SpectralJSONL {
       else {
         // For this projection, sparsity is the number of non-zeros
         int nonZeros = (int) Math.floor(sparsity * numProjections);
-        matrix = new FixedSparseRandomProjection(alphabet, numProjections, nonZeros, random);
+        FixedSparseRandomProjection fmatrix = new FixedSparseRandomProjection(alphabet, numProjections, nonZeros, random);
+        loadFSRP(fmatrix, instances);
+        matrix = fmatrix;
       }
     }
 
@@ -50,6 +46,76 @@ public class SpectralJSONL {
     //System.out.println("normalized");
 
     return matrix;
+  }
+
+  public static void loadFSRP(FixedSparseRandomProjection matrix, List<IntList> instances) {
+    for (IntList instance: instances) {
+      //HashMap<Integer,Integer> typeCounts = new HashMap<Integer,Integer>();
+
+      TIntIntHashMap typeCounts = new TIntIntHashMap();
+      int length = instance.size();
+
+      // Skip short documents
+      //if (length < 10) { continue; }
+
+      matrix.totalTokens += length;
+
+      for (int position = 0; position < length; position++) {
+        int type = instance.getQuick(position);
+        matrix.wordCounts[type]++;
+        typeCounts.adjustOrPutValue(type, 1, 1);
+      }
+
+      double inverseNumPairs = 2.0 / (length * (length - 1));
+      double coefficient = matrix.squareRootSparsity * 2.0 / (length * (length - 1));
+
+      int[] types = typeCounts.keys();
+      int[] counts = typeCounts.getValues();
+
+      // Multiply the counts by the random projection matrix
+      double[] projectedSignature = new double[matrix.numColumns];
+      for (int i = 0; i < types.length; i++) {
+        int type = types[i];
+        matrix.documentFrequencies[type]++;
+
+        for (int j = 0; j < matrix.nonZeros; j++) {
+          int projectionIndex = matrix.projectionMatrix[type][j];
+          if (projectionIndex >= matrix.numColumns) {
+            // If it's in this range, it should be negated
+            projectedSignature[projectionIndex - matrix.numColumns] += -counts[i];
+          }
+          else {
+            projectedSignature[projectionIndex] += counts[i];
+          }
+        }
+        matrix.rowSums[type] += inverseNumPairs * counts[i] * (length - counts[i]);
+      }
+
+      // Rescale for the sparse random projection and the length of the document
+      for (int j = 0; j < matrix.numColumns; j++) {
+        projectedSignature[j] *= coefficient;
+      }
+
+      // Now multiply by the counts again, subtracting the term for the word itself
+      for (int i = 0; i < types.length; i++) {
+        int type = types[i];
+        for (int denseIndex = 0; denseIndex < matrix.numColumns; denseIndex++) {
+          matrix.weights[type][denseIndex] += counts[i] * projectedSignature[denseIndex];
+        }
+        // Remove the diagonal elements as needed
+        for (int sparseIndex = 0; sparseIndex < matrix.nonZeros; sparseIndex++) {
+          int denseIndex = matrix.projectionMatrix[type][sparseIndex];
+          if (denseIndex >= matrix.numColumns) {
+            matrix.weights[type][denseIndex - matrix.numColumns] -= -coefficient * counts[i] * counts[i];
+          }
+          else {
+            matrix.weights[type][denseIndex] -= coefficient * counts[i] * counts[i];
+          }
+        }
+      }
+
+    }
+    //System.err.format("%d ms\n", (System.currentTimeMillis() - startTime));
   }
 
   public static void load(BigramProbabilityMatrix matrix, List<IntList> instances) {
@@ -93,12 +159,16 @@ public class SpectralJSONL {
   public static void main(String[] args) throws IOException {
     Parameters argp = Parameters.parseArgs(args);
 
-    int randomProjections = argp.get("randomProjections", 0);
-    double randomProjectionSparsity = argp.get("randomProjectionDensity", 1.0);
+    int randomProjections = argp.get("randomProjections", 1000);
+    double randomProjectionSparsity = argp.get("randomProjectionDensity", 0.01);
     Randoms random = new Randoms(argp.get("seed", 13));
-    final int depth = argp.get("depth", 20);
-    final int numTopics = argp.get("numTopics", 10);
-    final int minimumDocumentFrequency = argp.get("minimumDocumentFrequency", 1);
+    final int depth = argp.get("depth", 20000);
+    final int numTopics = argp.get("numTopics", 200);
+    final int minimumDocumentFrequency = argp.get("minimumDocumentFrequency", 10);
+    final int minWordFrequency = argp.get("minWordFrequency", 10);
+    final int maxWordFrequency = argp.get("maxWordFrequency", 100);
+    final int maxWordIterations = argp.get("maxWordIterations", 50);
+    final double minimumWordChange = argp.get("minWordChange", 0.001);
 
     TagTokenizer tok = new TagTokenizer();
     Set<String> stopwords = WordLists.getWordListOrDie("inquery");
@@ -106,25 +176,37 @@ public class SpectralJSONL {
     Alphabet alphabet = new Alphabet(1000);
     List<IntList> texts = new ArrayList<>();
 
-    try (LinesIterable docs = LinesIterable.fromFile(argp.get("input", "/home/jfoley/code/controversyNews/scripts/clueweb/clue09b.seed.jsonl.gz"))) {
-      for (String doc : docs) {
-        Parameters jdoc = Parameters.parseString(doc);
-        String raw_html = jdoc.getString("content");
-        String text = StrUtil.collapseSpecialMarks(Jsoup.parse(raw_html).text());
+    HashMap<String, String> tf10Qs = new HashMap<>();
+    try (LinesIterable lines = LinesIterable.fromFile("/home/jfoley/code/controversyNews/signal_tf10.txt.gz")) {
+      for (String line : lines) {
+        String[] col = line.split("\t");
+        if(col.length != 2) continue;
+        tf10Qs.put(col[0], col[1]);
+      }
+    }
+
+    TIntIntHashMap freqs = new TIntIntHashMap();
+    //try (LinesIterable docs = LinesIterable.fromFile(argp.get("input", "/home/jfoley/code/controversyNews/scripts/clueweb/clue09b.seed.jsonl.gz"))) {
+      for (String doc : tf10Qs.values()) {
+        //Parameters jdoc = Parameters.parseString(doc);
+        //String raw_html = jdoc.getString("content");
+        //String text = StrUtil.collapseSpecialMarks(Jsoup.parse(raw_html).text());
+        String text = doc;
         List<String> tdoc = tok.tokenize(text).terms;
         IntList ids = new IntList(tdoc.size());
         for (String term : tdoc) {
           if(stopwords.contains(term)) continue;
           if(StrUtil.looksLikeInt(term)) continue;
           if("com".equals(term)) continue;
-
-          ids.push(alphabet.lookupIndex(term, true));
+          int id = alphabet.lookupIndex(term, true);
+          freqs.adjustOrPutValue(id, 1, 1);
+          ids.push(id);
         }
         texts.add(ids);
 
-        if(docs.getLineNumber() > depth) break;
+        if(texts.size() > depth) break;
       }
-    }
+    //}
     System.out.println("Load & Tokenize, K="+alphabet.size());
 
     long start = System.nanoTime();
@@ -150,38 +232,53 @@ public class SpectralJSONL {
     orthogonalizer.clearMatrix();  // save some memory
     matrix = getMatrix(texts, alphabet, randomProjections, randomProjectionSparsity, random);
     SpectralLDA recover = new SpectralLDA(matrix, orthogonalizer);
+    recover.wordIterations = maxWordIterations;
+    recover.wordConvergenceZero = minimumWordChange;
 
     end = System.nanoTime();
     System.out.println("Total Time: "+((end - start) / 1e9)+"s");
 
-    IDSorter[][] topicSortedWords = new IDSorter[recover.numTopics][matrix.numWords];
+    IntList sparseWords = new IntList();
+    for (int i = 0; i < matrix.numWords; i++) {
+      if(freqs.get(i) < minWordFrequency) continue;
+      if(freqs.get(i) > maxWordFrequency) continue;
+      sparseWords.push(i);
+    }
+    IDSorter[][] topicSortedWords = new IDSorter[recover.numTopics][sparseWords.size()];
     //PrintStream out = System.out;
-    try (PrintWriter out = IO.openPrintWriter("matrix.out.gz")) {
+    //try (PrintWriter out = IO.openPrintWriter("matrix.out.gz")) {
 
-      for (int word = 0; word < matrix.numWords; word++) {
+      for (int wi = 0; wi < sparseWords.size(); wi++) {
+        int word = sparseWords.getQuick(wi);
+        if(freqs.get(word) < minWordFrequency) continue;
         double wordProb = matrix.unigramProbability(word);
         double[] weights = recover.recover(word);
 
         for (int topic = 0; topic < weights.length; topic++) {
           //out.format("%d:%.8f ", topic, wordProb * weights[topic]);
-          out.print(wordProb * weights[topic] + "\t");
-          topicSortedWords[topic][word] = new IDSorter(word, wordProb * weights[topic]);
+          //out.print(wordProb * weights[topic] + "\t");
+          topicSortedWords[topic][wi] = new IDSorter(word, wordProb * weights[topic]);
         }
-        out.println();
+        //out.println();
 
-        if (word > 0 && word % 1000 == 0) {
-          System.out.format("[%d] %s\n", word, alphabet.lookupObject(word));
+        if (wi > 0 && wi % 1000 == 0) {
+          System.err.format("[%d] %s\n", word, alphabet.lookupObject(word));
         }
       }
-    }
+    //}
 
     end = System.nanoTime();
     System.out.println("Total Topic Time: "+((end - start) / 1e9)+"s");
 
     for (int topic = 0; topic < recover.numTopics; topic++) {
-      Arrays.sort(topicSortedWords[topic]);
+      Arrays.sort(topicSortedWords[topic], (lhs, rhs) -> {
+        int cmp = Double.compare(lhs.getWeight(), rhs.getWeight());
+        if(cmp == 0)
+          return Integer.compare(lhs.getID(), rhs.getID());
+        return -cmp;
+      });
       StringBuilder builder = new StringBuilder();
-      for (int i = 0; i < 20; i++) {
+      for (int i = 0; i < 10; i++) {
         builder.append(alphabet.lookupObject(topicSortedWords[topic][i].getID()) + " ");
       }
       System.out.format("%d\t%s\t%s\n", topic, alphabet.lookupObject(orthogonalizer.basisVectorIndices[topic]), builder);
